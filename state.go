@@ -35,11 +35,15 @@ type AppState struct {
 	// Settings is the user-facing preference blob edited from the ui
 	Settings json.RawMessage `json:"settings,omitempty"`
 
+	// users telemetry choice
+	CheckinConsent string `json:"checkin_consent,omitempty"`
+
 	// last offset from the check in service
 	UtcOffsetMin *int `json:"utc_offset_min,omitempty"`
 
 	// newest release
-	LatestVersion    string   `json:"latest_version,omitempty"`
-	LatestHighlights []string `json:"latest_highlights,omitempty"`
-	UpdateMandatory  bool     `json:"update_mandatory,omitempty"`
+	LatestVersion          string   `json:"latest_version,omitempty"`
+	LatestHighlights       []string `json:"latest_highlights,omitempty"`
+	CheckinInstallReported bool     `json:"checkin_install_reported,omitempty"`
+	UpdateMandatory        bool     `json:"update_mandatory,omitempty"`
 }

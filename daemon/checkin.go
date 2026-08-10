@@ -2,12 +2,15 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +22,8 @@ const (
 	checkinRetryInterval  = 2 * time.Minute
 	checkinRequestTimeout = 10 * time.Second
 	checkinJitter         = 30 * time.Minute
+
+	cpuinfoPath = "/proc/cpuinfo"
 )
 
 func checkinWait() time.Duration {
@@ -55,6 +60,33 @@ func (t *checkinTracker) LastError() string {
 	return t.lastError
 }
 
+func parseCpuinfoSerial(b []byte) string {
+	for _, line := range strings.Split(string(b), "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(k) != "Serial" {
+			continue
+		}
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func checkinIdFromSerial(serial string) string {
+	if serial == "" || strings.Trim(serial, "0") == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("mira-v1:" + serial))
+	return hex.EncodeToString(sum[:16])
+}
+
+func readCheckinId() string {
+	b, err := os.ReadFile(cpuinfoPath)
+	if err != nil {
+		return ""
+	}
+	return checkinIdFromSerial(parseCpuinfoSerial(b))
+}
+
 func normalizeVersion(v string) string {
 	return strings.TrimPrefix(strings.TrimSpace(v), "v")
 }
@@ -88,6 +120,49 @@ func parseVersionParts(v string) ([3]int, bool) {
 		out[i] = n
 	}
 	return out, true
+}
+
+func checkinConsentFromSettings(body []byte) string {
+	var s struct {
+		CheckinConsent *string `json:"checkinConsent"`
+	}
+	if json.Unmarshal(body, &s) == nil && s.CheckinConsent != nil {
+		if v := *s.CheckinConsent; v == "granted" || v == "denied" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (app *App) setCheckinConsent(consent string) {
+	app.state.Lock()
+	changed := app.state.CheckinConsent != consent
+	app.state.CheckinConsent = consent
+	app.state.Unlock()
+	if !changed {
+		return
+	}
+	app.log.Infof("checkin: consent set to %s", consent)
+	select {
+	case app.checkinKick <- struct{}{}:
+	default:
+	}
+}
+
+func (app *App) checkinConsent() string {
+	app.state.Lock()
+	defer app.state.Unlock()
+	return app.state.CheckinConsent
+}
+
+func (app *App) checkinConsentForStatus() string {
+	if !app.cfg.Checkin || app.cfg.CheckinURL == "" || app.checkinId == "" {
+		return "disabled"
+	}
+	if c := app.checkinConsent(); c != "" {
+		return c
+	}
+	return "unset"
 }
 
 func (app *App) utcOffsetMin() *int {
@@ -137,17 +212,23 @@ func (app *App) startCheckin() {
 		app.log.Debug("checkin: disabled by config")
 		return
 	}
-	go app.runCheckinLoop(normalizeVersion(firmwareVersion()))
+	if app.checkinId == "" {
+		app.log.Debug("checkin: no chip serial, staying out of the numbers")
+	}
+	go app.runCheckinLoop(app.checkinId, normalizeVersion(firmwareVersion()))
 }
 
-func (app *App) runCheckinLoop(version string) {
+// The loop runs whatever the consent choice is: the clock and the update
+// notifier both hang off this response and neither is telemetry. Consent only
+// decides what the request carries, and so what the service is able to count.
+func (app *App) runCheckinLoop(id, version string) {
 	ctx := context.Background()
 	for {
 		for app.waitOnline(ctx, time.Hour) != nil {
 		}
 
 		wait := checkinWait()
-		if err := app.doCheckin(ctx, version); err != nil {
+		if err := app.doCheckin(ctx, id, version, app.checkinConsent()); err != nil {
 			app.checkinStatus.noteError(time.Now(), err)
 			app.log.WithError(err).Debug("checkin: request failed")
 			if !app.hasCheckedInEver() {
@@ -157,13 +238,32 @@ func (app *App) runCheckinLoop(version string) {
 			app.checkinStatus.noteSuccess(time.Now())
 		}
 
-		time.Sleep(wait)
+		select {
+		case <-time.After(wait):
+		case <-app.checkinKick:
+		}
 	}
 }
 
-func (app *App) doCheckin(ctx context.Context, version string) error {
+func (app *App) doCheckin(ctx context.Context, id, version, consent string) error {
 	q := url.Values{}
 	q.Set("version", version)
+	// Opting out costs the service one number: a single lifetime install ping.
+	// Every later request is a bare version lookup that nothing records. An
+	// unanswered card sends nothing at all, so the count only ever follows a
+	// choice the user actually made.
+	identified := consent == "granted" && id != ""
+	sentInstall := false
+	if identified {
+		q.Set("id", id)
+	} else if consent == "denied" {
+		app.state.Lock()
+		sentInstall = !app.state.CheckinInstallReported
+		app.state.Unlock()
+		if sentInstall {
+			q.Set("install", "1")
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, checkinRequestTimeout)
 	defer cancel()
@@ -214,6 +314,10 @@ func (app *App) doCheckin(ctx context.Context, version string) error {
 	mandatory := out.UpdateMandatory != nil && *out.UpdateMandatory
 	if app.state.UpdateMandatory != mandatory {
 		app.state.UpdateMandatory = mandatory
+		changed = true
+	}
+	if (identified || sentInstall) && !app.state.CheckinInstallReported {
+		app.state.CheckinInstallReported = true
 		changed = true
 	}
 	app.state.Unlock()

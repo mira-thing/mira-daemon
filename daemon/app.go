@@ -83,6 +83,8 @@ type App struct {
 	clockSteps clockStepTracker
 
 	// check in service
+	checkinId     string
+	checkinKick   chan struct{}
 	checkinStatus checkinTracker
 
 	closed bool
@@ -112,15 +114,16 @@ func New(opts *Options) (*App, error) {
 	}
 
 	app := &App{
-		log:        opts.Logger,
-		cfg:        opts.Config,
-		stateStore: opts.StateStore,
-		logoutCh:   make(chan *AppPlayer),
-		client:     &http.Client{Timeout: 30 * time.Second},
-		retryNowCh: make(chan struct{}, 1),
-		onlineCh:   make(chan struct{}),
-		hashes:     newHashStore(),
-		startedAt:  time.Now(),
+		log:         opts.Logger,
+		cfg:         opts.Config,
+		stateStore:  opts.StateStore,
+		logoutCh:    make(chan *AppPlayer),
+		client:      &http.Client{Timeout: 30 * time.Second},
+		retryNowCh:  make(chan struct{}, 1),
+		onlineCh:    make(chan struct{}),
+		checkinKick: make(chan struct{}, 1),
+		hashes:      newHashStore(),
+		startedAt:   time.Now(),
 	}
 
 	var err error
@@ -248,6 +251,7 @@ func New(opts *Options) (*App, error) {
 	startNetworkMonitor(app.log, app.server, onNetTransition)
 	app.startClockWatch()
 
+	app.checkinId = readCheckinId()
 	app.startCheckin()
 
 	app.startButtonFallback()
@@ -384,6 +388,10 @@ func (app *App) PutSettings(body []byte) error {
 	// react to the voice mic on/off toggle
 	if app.voice != nil {
 		app.voice.setWakeEnabled(voiceMicFromSettings(body))
+	}
+	// react to the telemetry consent card / settings toggle
+	if c := checkinConsentFromSettings(body); c != "" {
+		app.setCheckinConsent(c)
 	}
 	return app.persistState()
 }
