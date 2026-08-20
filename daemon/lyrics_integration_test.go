@@ -233,9 +233,9 @@ func TestFetchLyrics_SecondaryHappyPathReturnsSyncedLyrics(t *testing.T) {
 	if len(result.Lines) != 2 {
 		t.Errorf("expected 2 lines, got %d", len(result.Lines))
 	}
-	cached, ok := lp.cache["track-abc"]
+	cached, ok := lp.cache[lyricsCacheKey("track-abc", "Hello", "Test")]
 	if !ok || cached != result {
-		t.Errorf("FetchLyrics did not cache the result by trackId")
+		t.Errorf("FetchLyrics did not cache the result under its lookup key")
 	}
 }
 
@@ -486,7 +486,7 @@ func TestFetchLyrics_ConcurrentCallsForSameTrackDoNotDeadlock(t *testing.T) {
 	// the cache populated despite the race.
 	lp.mu.RLock()
 	defer lp.mu.RUnlock()
-	if _, ok := lp.cache["concurrent-key"]; !ok {
+	if _, ok := lp.cache[lyricsCacheKey("concurrent-key", "X", "Y")]; !ok {
 		t.Error("cache entry not populated after concurrent calls")
 	}
 }

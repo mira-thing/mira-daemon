@@ -1215,15 +1215,15 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 	case ApiRequestTypeSetShufflingContext:
 		val, _ := req.Data.(bool)
 		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "set_shuffling_context", Value: val})
-	case ApiRequestTypeDjSignal:
-		// the receiving Spotify client acts on this and asks the backend for a new DJ set
-		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "signal", SignalId: "jump"})
 	case ApiRequestTypeSetRepeatingContext:
 		val, _ := req.Data.(bool)
 		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "set_repeating_context", Value: val})
 	case ApiRequestTypeSetRepeatingTrack:
 		val, _ := req.Data.(bool)
 		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "set_repeating_track", Value: val})
+	case ApiRequestTypeDjSignal:
+		// the receiving Spotify client acts on this and asks the backend for a new DJ set
+		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "signal", SignalId: "jump"})
 
 	case ApiRequestTypeGetVolume:
 		rs := p.state.remoteState
