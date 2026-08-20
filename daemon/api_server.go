@@ -201,6 +201,7 @@ const (
 	ApiRequestTypeSetRepeatingContext ApiRequestType = "repeating_context"
 	ApiRequestTypeSetRepeatingTrack   ApiRequestType = "repeating_track"
 	ApiRequestTypeSetShufflingContext ApiRequestType = "shuffling_context"
+	ApiRequestTypeDjSignal            ApiRequestType = "dj_signal"
 	ApiRequestTypeAddToQueue          ApiRequestType = "add_to_queue"
 	ApiRequestTypeGetSaved            ApiRequestType = "get_saved"
 	ApiRequestTypeSetSaved            ApiRequestType = "set_saved"
@@ -1147,6 +1148,15 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeSetShufflingContext, Data: data.Shuffle}, w)
+	})
+	// tell the active device to switch to a new DJ set. Momentary, so no body
+	m.HandleFunc("/player/dj_signal", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeDjSignal}, w)
 	})
 	m.HandleFunc("/player/add_to_queue", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
