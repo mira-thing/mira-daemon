@@ -470,6 +470,32 @@ func TestPlayerShuffleContext_BodyShapeDispatchesBool(t *testing.T) {
 	}
 }
 
+func TestPlayerDjSignal_DispatchesWithoutBody(t *testing.T) {
+	t.Parallel()
+
+	srv, base := newTestApiServer(t)
+	srv.SetPlayerReady(true)
+	captured := drainOne(t, srv, nil, nil)
+
+	// momentary action, so the route must dispatch even with no request body
+	resp, err := testClient.Post(base+"/player/dj_signal", "application/json", nil)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d want 200", resp.StatusCode)
+	}
+	req := <-captured
+	if got, want := req.Type, ApiRequestTypeDjSignal; got != want {
+		t.Errorf("Type: got %q want %q", got, want)
+	}
+	if req.Data != nil {
+		t.Errorf("Data: got %v want nil", req.Data)
+	}
+}
+
 func TestPlayerPlay_EmptyUriRejected(t *testing.T) {
 	t.Parallel()
 
@@ -505,6 +531,7 @@ func TestPlayerEndpoints_WrongMethodReturns405(t *testing.T) {
 		"/player/shuffle_context",
 		"/player/repeat_context",
 		"/player/repeat_track",
+		"/player/dj_signal",
 	} {
 		t.Run(path, func(t *testing.T) {
 			t.Parallel()

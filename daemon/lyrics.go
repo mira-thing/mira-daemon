@@ -62,7 +62,7 @@ type LyricsProvider struct {
 	secondary *secondaryLyricProvider
 
 	mu    sync.RWMutex
-	cache map[string]*LyricsResult // keyed by trackId/episode id
+	cache map[string]*LyricsResult // keyed by lyricsCacheKey, not by track id alone
 }
 
 func NewLyricsProvider(logger librespot.Logger, getAccessToken func(ctx context.Context, force bool) (string, error)) *LyricsProvider {
@@ -90,14 +90,24 @@ func hasWords(r *LyricsResult) bool {
 	return false
 }
 
+// identifies a lookup rather than a track: ids are not unique per lookup, since the DJ
+// narration shares the id of the song it introduces
+func lyricsCacheKey(trackId, trackName, artistName string) string {
+	norm := func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+	// unit separator: should not appear in an id, a title or an artist name
+	return trackId + "\x1f" + norm(trackName) + "\x1f" + norm(artistName)
+}
+
 // FetchLyrics returns the best lyrics for a track
 func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, artistName, albumName string, durationMs int, wantRichsync bool) (*LyricsResult, error) {
 	if trackName == "" {
 		return nil, fmt.Errorf("track name is required")
 	}
 
+	key := lyricsCacheKey(trackId, trackName, artistName)
+
 	lp.mu.RLock()
-	cached, ok := lp.cache[trackId]
+	cached, ok := lp.cache[key]
 	lp.mu.RUnlock()
 	if ok {
 		// a nil entry is a negative cache
@@ -125,7 +135,7 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 				return cached, nil
 			}
 		} else if res != nil {
-			lp.store(trackId, res)
+			lp.store(key, res)
 			lp.log.Debugf("lyrics: richsync (word-level) for %q by %q (%d lines)", trackName, artistName, len(res.Lines))
 			return res, nil
 		}
@@ -162,22 +172,22 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 		// cache the negative only when every source returns no lyrics
 		if !sawTransientError && artistName != "" {
 			lp.mu.Lock()
-			lp.storeLocked(trackId, nil)
+			lp.storeLocked(key, nil)
 			lp.mu.Unlock()
 			lp.log.Debugf("lyrics: confirmed none for %q by %q, caching negative", trackName, artistName)
 		}
 		return nil, ErrNoLyrics
 	}
 
-	lp.store(trackId, result)
+	lp.store(key, result)
 
 	lp.log.Debugf("lyrics found for %q by %q (%s, %d lines)", trackName, artistName, result.SyncType, len(result.Lines))
 	return result, nil
 }
 
-func (lp *LyricsProvider) store(trackId string, result *LyricsResult) {
+func (lp *LyricsProvider) store(key string, result *LyricsResult) {
 	lp.mu.Lock()
-	lp.storeLocked(trackId, result)
+	lp.storeLocked(key, result)
 	lp.mu.Unlock()
 }
 
@@ -202,9 +212,9 @@ func (lp *LyricsProvider) FetchEpisodeText(ctx context.Context, episodeId string
 	return result, nil
 }
 
-// storeLocked records a cache entry
-func (lp *LyricsProvider) storeLocked(trackId string, result *LyricsResult) {
-	lp.cache[trackId] = result
+// storeLocked records a cache entry, keyed by lyricsCacheKey
+func (lp *LyricsProvider) storeLocked(key string, result *LyricsResult) {
+	lp.cache[key] = result
 	if len(lp.cache) > 200 {
 		lp.evictOldestLocked()
 	}

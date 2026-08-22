@@ -61,7 +61,7 @@ func TestFetchLyrics_NoLyricsCachedSkipsRefetch(t *testing.T) {
 
 	// the cache holds an explicit nil (negative) entry
 	lp.mu.RLock()
-	v, ok := lp.cache["track-instrumental"]
+	v, ok := lp.cache[lyricsCacheKey("track-instrumental", "X", "Y")]
 	lp.mu.RUnlock()
 	if !ok || v != nil {
 		t.Errorf("expected a nil negative cache entry, got ok=%v v=%v", ok, v)
@@ -100,7 +100,7 @@ func TestFetchLyrics_TransientFailureNotCached(t *testing.T) {
 
 	// a transient failure must leave the cache empty
 	lp.mu.RLock()
-	_, cached := lp.cache["track-maybe"]
+	_, cached := lp.cache[lyricsCacheKey("track-maybe", "X", "Y")]
 	lp.mu.RUnlock()
 	if cached {
 		t.Fatal("transient failure was cached as a negative; lyrics could appear on retry")
@@ -112,5 +112,65 @@ func TestFetchLyrics_TransientFailureNotCached(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&secReqs); got <= sec1 {
 		t.Errorf("expected upstream re-query after a transient failure; secondary reqs stayed at %d", got)
+	}
+}
+
+// The DJ narration shares the track id of the song it introduces, so a negative cached for the
+// narration used to be served to the song.
+func TestFetchLyrics_NarrationNegativeDoesNotPoisonTheSong(t *testing.T) {
+	t.Parallel()
+
+	// the id shared by the narration and the song it introduces
+	const sharedId = "2VQ5Zw5bDevO8iRx1EQ2gr"
+
+	var lrcReqs int32
+	lrc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&lrcReqs, 1)
+		// nothing is written about what the DJ says
+		if r.URL.Query().Get("artist_name") == "DJ X" {
+			w.WriteHeader(404)
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"instrumental": false,
+			"syncedLyrics": "[00:00.000]real line one\n[00:05.000]real line two",
+			"plainLyrics": ""
+		}`))
+	}))
+	t.Cleanup(lrc.Close)
+
+	ter := newTestTertiaryProviderHTTP()
+	ter.url = lrc.URL
+	lp := newTestOrchestrator(ter)
+
+	// finds nothing, caches a negative under its own key
+	if _, err := lp.FetchLyrics(context.Background(), sharedId, "Up next", "DJ X", "", 3_056, false); !errors.Is(err, ErrNoLyrics) {
+		t.Fatalf("narration lookup: got %v, want ErrNoLyrics", err)
+	}
+	afterNarration := atomic.LoadInt32(&lrcReqs)
+	if afterNarration == 0 {
+		t.Fatal("narration lookup should have reached upstream")
+	}
+
+	// same id, different lookup, so the negative must not answer it
+	result, err := lp.FetchLyrics(context.Background(), sharedId, "Tall Pines", "Ed Prosek", "", 194_210, false)
+	if err != nil {
+		t.Fatalf("song lookup after narration: got %v, want lyrics", err)
+	}
+	if len(result.Lines) != 2 {
+		t.Errorf("expected the song's 2 lines, got %d", len(result.Lines))
+	}
+	if got := atomic.LoadInt32(&lrcReqs); got == afterNarration {
+		t.Error("song lookup was served from the narration's cache entry instead of querying upstream")
+	}
+
+	// and each is cached under its own key
+	lp.mu.RLock()
+	defer lp.mu.RUnlock()
+	if v, ok := lp.cache[lyricsCacheKey(sharedId, "Up next", "DJ X")]; !ok || v != nil {
+		t.Errorf("narration: want a negative entry, got ok=%v v=%v", ok, v)
+	}
+	if v, ok := lp.cache[lyricsCacheKey(sharedId, "Tall Pines", "Ed Prosek")]; !ok || v == nil {
+		t.Errorf("song: want a positive entry, got ok=%v v=%v", ok, v)
 	}
 }

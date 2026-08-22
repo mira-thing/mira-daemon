@@ -1223,6 +1223,9 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 	case ApiRequestTypeSetRepeatingTrack:
 		val, _ := req.Data.(bool)
 		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "set_repeating_track", Value: val})
+	case ApiRequestTypeDjSignal:
+		// the receiving Spotify client acts on this and asks the backend for a new DJ set
+		return nil, p.sendActiveDeviceCommand(ctx, connectCommand{Endpoint: "signal", SignalId: "jump"})
 
 	case ApiRequestTypeGetVolume:
 		rs := p.state.remoteState
@@ -1344,6 +1347,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 // connectCommand is the JSON shape of a single Spotify Connect remote-control command
 type connectCommand struct {
 	Endpoint      string             `json:"endpoint"`
+	SignalId      string             `json:"signal_id,omitempty"`
 	Value         any                `json:"value,omitempty"`
 	Context       *connectContext    `json:"context,omitempty"`
 	Options       *connectOptions    `json:"options,omitempty"`
