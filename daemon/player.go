@@ -1269,34 +1269,15 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if data.Uri == "" {
 			return nil, fmt.Errorf("play requires a context uri")
 		}
-		cmd := connectCommand{
-			Endpoint: "play",
-			Context: &connectContext{
-				Uri: data.Uri,
-				Url: "context://" + data.Uri,
-			},
-			Options: &connectOptions{License: "tft"},
-			PlayOrigin: &connectOrigin{
-				FeatureIdentifier:  "your_library",
-				FeatureVersion:     "go-librespot",
-				ReferrerIdentifier: "your_library",
-			},
-			LoggingParams: &connectLogging{
-				PageInstanceIds: []string{},
-				InteractionIds:  []string{},
-				CommandId:       randomCommandId(),
-			},
-		}
-		if data.SkipToUri != "" {
-			cmd.Options.SkipTo = connectSkipTo{TrackUri: data.SkipToUri}
-		}
+		cmd := buildPlayCommand(data)
 		shuf := "inherit"
 		if data.Shuffle != nil {
-			cmd.Options.PlayerOptionsOverride.ShufflingContext = data.Shuffle
 			shuf = fmt.Sprintf("%v", *data.Shuffle)
 		}
 		// TEMP diagnostic logging while verifying the play envelope on hardware.
-		p.app.log.Infof("play: context=%s skipTo=%q shuffle=%s -> active device", data.Uri, data.SkipToUri, shuf)
+		// which envelope went out is otherwise invisible on device.
+		p.app.log.Infof("play: context=%s skipTo=%q shuffle=%s dj=%v -> active device",
+			data.Uri, data.SkipToUri, shuf, data.Uri == djContextUri)
 		return nil, p.sendActiveDeviceCommand(ctx, cmd)
 
 	case ApiRequestTypeSearch:
@@ -1344,6 +1325,46 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 	}
 }
 
+// The DJ set is an agentic session, not a static playlist: it resolves only through the lexicon
+// session provider, so a context:// url cannot start it and the receiving client declines the
+// command without saying so. Mirrors DJ_PLAYLIST_URI in mira-ui/src/hooks/useDJNarration.ts.
+const djContextUri = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq"
+const djContextResolveUrl = "hm://lexicon-session-provider/context-resolve/v2/session?contextUri="
+
+// buildPlayCommand turns a play request into the connect command for it. Pure, so the envelope
+// can be pinned by a test without a session.
+func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
+	cmd := connectCommand{
+		Endpoint: "play",
+		Context: &connectContext{
+			Uri: data.Uri,
+			Url: "context://" + data.Uri,
+		},
+		Options: &connectOptions{License: "tft"},
+		PlayOrigin: &connectOrigin{
+			FeatureIdentifier:  "your_library",
+			FeatureVersion:     "go-librespot",
+			ReferrerIdentifier: "your_library",
+		},
+		LoggingParams: &connectLogging{
+			PageInstanceIds: []string{},
+			InteractionIds:  []string{},
+			CommandId:       randomCommandId(),
+		},
+	}
+	if data.Uri == djContextUri {
+		cmd.Context.EntityUri = djContextUri
+		cmd.Context.Url = djContextResolveUrl + djContextUri
+	}
+	if data.SkipToUri != "" {
+		cmd.Options.SkipTo = connectSkipTo{TrackUri: data.SkipToUri}
+	}
+	if data.Shuffle != nil {
+		cmd.Options.PlayerOptionsOverride.ShufflingContext = data.Shuffle
+	}
+	return cmd
+}
+
 // connectCommand is the JSON shape of a single Spotify Connect remote-control command
 type connectCommand struct {
 	Endpoint      string             `json:"endpoint"`
@@ -1364,9 +1385,11 @@ type connectQueueTrack struct {
 
 // connectContext/connectOptions/connectOrigin/connectLogging are the play-command sub-objects
 type connectContext struct {
-	Uri      string   `json:"uri"`
-	Url      string   `json:"url,omitempty"`
-	Metadata struct{} `json:"metadata"`
+	Uri string `json:"uri"`
+	// only the DJ session sets this
+	EntityUri string   `json:"entity_uri,omitempty"`
+	Url       string   `json:"url,omitempty"`
+	Metadata  struct{} `json:"metadata"`
 }
 
 type connectOptions struct {
