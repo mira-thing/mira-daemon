@@ -20,10 +20,22 @@ func mgmtEvent(opcode uint16, params []byte) []byte {
 
 // disconnectParams: bdaddr is wire-order (reversed), type, reason
 func disconnectParams(reversedAddr [6]byte, reason byte) []byte {
+	return disconnectParamsTyped(reversedAddr, mgmtAddrBREDR, reason)
+}
+
+func disconnectParamsTyped(reversedAddr [6]byte, addrType, reason byte) []byte {
 	p := make([]byte, 8)
 	copy(p, reversedAddr[:])
-	p[6] = 0x00 // BR/EDR
+	p[6] = addrType
 	p[7] = reason
+	return p
+}
+
+// connectParams: bdaddr, type, then flags(4) + eir_len(2)
+func connectParams(reversedAddr [6]byte, addrType byte) []byte {
+	p := make([]byte, 13)
+	copy(p, reversedAddr[:])
+	p[6] = addrType
 	return p
 }
 
@@ -34,9 +46,15 @@ func TestParseMgmtDisconnect_ValidEvent(t *testing.T) {
 	buf := mgmtEvent(mgmtEvDeviceDisconnected,
 		disconnectParams([6]byte{0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA}, mgmtReasonRemote))
 
-	addr, reason, ok := parseMgmtDisconnect(buf)
+	opcode, addr, addrType, reason, ok := parseMgmtEvent(buf)
 	if !ok {
 		t.Fatal("expected ok")
+	}
+	if opcode != mgmtEvDeviceDisconnected {
+		t.Errorf("opcode: got %#x", opcode)
+	}
+	if isLEAddrType(addrType) {
+		t.Error("BR/EDR must not be classified as an LE link")
 	}
 	if addr != "AA:BB:CC:DD:EE:FF" {
 		t.Errorf("addr: got %q", addr)
@@ -50,13 +68,13 @@ func TestParseMgmtDisconnect_RejectsOtherOpcodesAndShortPackets(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string][]byte{
-		"other opcode":   mgmtEvent(0x000B, disconnectParams([6]byte{}, 1)),
+		"other opcode":   mgmtEvent(0x0001, disconnectParams([6]byte{}, 1)),
 		"short header":   {0x0C, 0x00, 0x00},
 		"short params":   mgmtEvent(mgmtEvDeviceDisconnected, []byte{1, 2, 3}),
 		"plen oversells": func() []byte { b := mgmtEvent(mgmtEvDeviceDisconnected, disconnectParams([6]byte{}, 1)); return b[:10] }(),
 	}
 	for name, buf := range cases {
-		if _, _, ok := parseMgmtDisconnect(buf); ok {
+		if _, _, _, _, ok := parseMgmtEvent(buf); ok {
 			t.Errorf("%s: expected !ok", name)
 		}
 	}
@@ -244,5 +262,63 @@ func TestHandleDisconnectReason_AuthFailureUnknownDeviceIgnored(t *testing.T) {
 
 	if len(events) != 0 {
 		t.Fatalf("auth-failures from unknown devices must not emit, got %v", events)
+	}
+}
+
+func TestParseMgmtEvent_ConnectedLE(t *testing.T) {
+	t.Parallel()
+
+	// connected payload continues with flags(4) + eir_len(2)
+	pkt := mgmtEvent(mgmtEvDeviceConnected, connectParams([6]byte{0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA}, mgmtAddrLERandom))
+	opcode, addr, addrType, reason, ok := parseMgmtEvent(pkt)
+	if !ok {
+		t.Fatal("should parse a device-connected event")
+	}
+	if opcode != mgmtEvDeviceConnected {
+		t.Errorf("opcode = %#x", opcode)
+	}
+	if addr != "AA:BB:CC:DD:EE:FF" {
+		t.Errorf("addr = %q", addr)
+	}
+	if !isLEAddrType(addrType) {
+		t.Errorf("addrType %#x should be LE", addrType)
+	}
+	if reason != 0 {
+		t.Errorf("connected events carry no reason, got %#x", reason)
+	}
+}
+
+func TestParseMgmtEvent_DisconnectedBREDRKeepsReason(t *testing.T) {
+	t.Parallel()
+
+	pkt := mgmtEvent(mgmtEvDeviceDisconnected, disconnectParamsTyped([6]byte{0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA}, mgmtAddrBREDR, mgmtReasonRemote))
+	opcode, addr, addrType, reason, ok := parseMgmtEvent(pkt)
+	if !ok {
+		t.Fatal("should parse a device-disconnected event")
+	}
+	if opcode != mgmtEvDeviceDisconnected || addr != "AA:BB:CC:DD:EE:FF" {
+		t.Errorf("opcode=%#x addr=%q", opcode, addr)
+	}
+	if isLEAddrType(addrType) {
+		t.Error("BR/EDR must not be classified as an LE link")
+	}
+	if reason != mgmtReasonRemote {
+		t.Errorf("reason = %#x, want %#x", reason, mgmtReasonRemote)
+	}
+}
+
+func TestParseMgmtEvent_RejectsShortAndUnrelated(t *testing.T) {
+	t.Parallel()
+
+	if _, _, _, _, ok := parseMgmtEvent([]byte{0x0B}); ok {
+		t.Error("a truncated packet must not parse")
+	}
+	// disconnect needs the reason byte, so a 7-byte payload is short
+	short := mgmtEvent(mgmtEvDeviceDisconnected, connectParams([6]byte{}, mgmtAddrLEPublic)[:7])
+	if _, _, _, _, ok := parseMgmtEvent(short); ok {
+		t.Error("a disconnect with no reason byte must not parse")
+	}
+	if _, _, _, _, ok := parseMgmtEvent(mgmtEvent(0x0001, connectParams([6]byte{}, mgmtAddrBREDR))); ok {
+		t.Error("unrelated opcodes must be ignored")
 	}
 }

@@ -110,10 +110,11 @@ type DebugStatusPayload struct {
 
 	Spotify string `json:"spotify"`
 
-	BluetoothDevice string `json:"bluetooth_device"`
-	PhoneVolume     string `json:"phone_volume"`
-	PhoneVolumeErr  string `json:"phone_volume_err"`
-	AndroidVolume   string `json:"android_volume"`
+	BluetoothDevice   string `json:"bluetooth_device"`
+	PhoneVolume       string `json:"phone_volume"`
+	PhoneVolumeErr    string `json:"phone_volume_err"`
+	AndroidVolume     string `json:"android_volume"`
+	AndroidVolumeSent int    `json:"android_volume_sent"`
 
 	VoiceEnabled bool `json:"voice_enabled"`
 	VoiceReady   bool `json:"voice_ready"`

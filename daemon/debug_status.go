@@ -82,6 +82,8 @@ func (app *App) DebugStatus() DebugStatusPayload {
 	}
 	p.PhoneVolumeErr = lastErr
 
+	p.AndroidVolumeSent = app.bt.HIDVolumeSent()
+
 	reg, sub, dead := app.bt.HIDVolumeStatus()
 	switch {
 	case sub:

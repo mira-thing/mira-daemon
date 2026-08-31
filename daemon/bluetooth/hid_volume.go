@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,8 +57,6 @@ const (
 	hidWatchdogCooldown       = 10 * time.Minute
 	hidAdvCycleGap            = 2 * time.Second
 
-	hidSuppressTTL = 20 * time.Second
-
 	hidAdvAppearanceKeyboard uint16 = 0x03C1
 )
 
@@ -85,6 +84,35 @@ var pnpIDValue = []byte{0x02, 0x6B, 0x1D, 0x46, 0x02, 0x00, 0x01}
 
 func gattErr(name, msg string) *dbus.Error {
 	return dbus.NewError(name, []interface{}{msg})
+}
+
+func shortUUID(u string) string {
+	if len(u) == 36 && strings.HasSuffix(u, "-0000-1000-8000-00805f9b34fb") {
+		return strings.TrimPrefix(u[:8], "0000")
+	}
+	return u
+}
+
+// renders the peer/link detail bluez passes with every read and write
+func gattPeer(options map[string]dbus.Variant) string {
+	dev, link, mtu := "?", "?", "?"
+	if v, ok := options["device"]; ok {
+		if path, ok := v.Value().(dbus.ObjectPath); ok {
+			dev = string(path)
+			if i := strings.LastIndex(dev, "dev_"); i >= 0 {
+				dev = strings.ReplaceAll(dev[i+4:], "_", ":")
+			}
+		}
+	}
+	if v, ok := options["link"]; ok {
+		if l, ok := v.Value().(string); ok && l != "" {
+			link = l
+		}
+	}
+	if v, ok := options["mtu"]; ok {
+		mtu = fmt.Sprint(v.Value())
+	}
+	return fmt.Sprintf("%s link=%s mtu=%s", dev, link, mtu)
 }
 
 type gattProps struct {
@@ -128,11 +156,13 @@ func (s *gattService) props() map[string]dbus.Variant {
 }
 
 type gattDesc struct {
-	path  dbus.ObjectPath
-	uuid  string
-	char  dbus.ObjectPath
-	flags []string
-	value []byte
+	path   dbus.ObjectPath
+	uuid   string
+	char   dbus.ObjectPath
+	flags  []string
+	value  []byte
+	log    librespot.Logger
+	onRead func()
 }
 
 func (d *gattDesc) props() map[string]dbus.Variant {
@@ -144,10 +174,19 @@ func (d *gattDesc) props() map[string]dbus.Variant {
 }
 
 func (d *gattDesc) ReadValue(options map[string]dbus.Variant) ([]byte, *dbus.Error) {
+	if d.log != nil {
+		d.log.Infof("bluetooth: hid: desc read %s by %s", shortUUID(d.uuid), gattPeer(options))
+	}
+	if d.onRead != nil {
+		d.onRead()
+	}
 	return d.value, nil
 }
 
 func (d *gattDesc) WriteValue(value []byte, options map[string]dbus.Variant) *dbus.Error {
+	if d.log != nil {
+		d.log.Infof("bluetooth: hid: desc write %s by %s (%d bytes)", shortUUID(d.uuid), gattPeer(options), len(value))
+	}
 	return nil
 }
 
@@ -162,6 +201,7 @@ type gattChar struct {
 
 	onStopNotify  func()
 	onStartNotify func()
+	onRead        func()
 
 	mu        sync.Mutex
 	value     []byte
@@ -180,12 +220,17 @@ func (c *gattChar) props() map[string]dbus.Variant {
 }
 
 func (c *gattChar) ReadValue(options map[string]dbus.Variant) ([]byte, *dbus.Error) {
+	c.log.Infof("bluetooth: hid: read %s by %s", shortUUID(c.uuid), gattPeer(options))
+	if c.onRead != nil {
+		c.onRead()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]byte(nil), c.value...), nil
 }
 
 func (c *gattChar) WriteValue(value []byte, options map[string]dbus.Variant) *dbus.Error {
+	c.log.Infof("bluetooth: hid: write %s by %s (%d bytes)", shortUUID(c.uuid), gattPeer(options), len(value))
 	c.mu.Lock()
 	c.value = append([]byte(nil), value...)
 	c.mu.Unlock()
@@ -249,15 +294,12 @@ func (a *gattApp) GetManagedObjects() (map[dbus.ObjectPath]map[string]map[string
 }
 
 // LE advertisement object
-type hidAdvertisement struct {
-	localName string
-}
+type hidAdvertisement struct{}
 
 func (a *hidAdvertisement) props() map[string]dbus.Variant {
 	return map[string]dbus.Variant{
 		"Type":         dbus.MakeVariant("peripheral"),
 		"ServiceUUIDs": dbus.MakeVariant([]string{"1812"}),
-		"LocalName":    dbus.MakeVariant(a.localName),
 		"Appearance":   dbus.MakeVariant(hidAdvAppearanceKeyboard),
 		"Discoverable": dbus.MakeVariant(true),
 	}
@@ -270,28 +312,30 @@ type hidVolume struct {
 	conn    *dbus.Conn
 	adapter dbus.ObjectPath
 	input   *gattChar
-	// battery-level subscription doubles as a "live GATT link" probe
-	battery *gattChar
 
 	regMu         sync.Mutex
 	appRegistered bool
 	advRegistered bool
-	// advertising both identities during initial pairing makes Android bounce
-	// between "phone" and "keyboard"
-	bondGate      bool
-	setupSuppress bool
-	suppressTimer *time.Timer
 	closed        bool
 	advFailures   int
 	// the connected phone was nudged and still won't subscribe to volume
 	subDead bool
+
+	// which HID characteristics the host has actually read since daemon start
+	readMu   sync.Mutex
+	charRead map[string]bool
+
+	// input reports actually emitted
+	sentMu      sync.Mutex
+	sentReports int
 
 	onAdvUp func()
 
 	watchdogMu sync.Mutex
 	watchdogAt map[string]time.Time
 
-	peerConnected func() bool
+	// reports whether any peer holds an LE link
+	leLinkUp func() bool
 
 	pokeCh   chan struct{}
 	sendCh   chan int // signed steps
@@ -324,6 +368,7 @@ func newHIDVolume(log librespot.Logger, conn *dbus.Conn, adapter dbus.ObjectPath
 		path: input.path + "/desc0", uuid: uuidReportRef,
 		char: input.path, flags: []string{"read"},
 		value: []byte{0x01, 0x01}, // Report ID 1
+		log:   log,
 	}}
 	hidInfo := newChar(hidSvc.path, 3, uuidHIDInfo, []string{"read"}, hidInfoValue)
 	controlPoint := newChar(hidSvc.path, 4, uuidControlPoint, []string{"write-without-response"}, []byte{})
@@ -367,7 +412,7 @@ func newHIDVolume(log librespot.Logger, conn *dbus.Conn, adapter dbus.ObjectPath
 			}
 		}
 	}
-	adv := &hidAdvertisement{localName: localName}
+	adv := &hidAdvertisement{}
 	if err := conn.Export(adv, hidAdvPath, leAdvIface); err != nil {
 		return nil, fmt.Errorf("export hid advertisement: %w", err)
 	}
@@ -380,7 +425,6 @@ func newHIDVolume(log librespot.Logger, conn *dbus.Conn, adapter dbus.ObjectPath
 		conn:       conn,
 		adapter:    adapter,
 		input:      input,
-		battery:    battLevel,
 		watchdogAt: make(map[string]time.Time),
 		pokeCh:     make(chan struct{}, 1),
 		sendCh:     make(chan int, 8),
@@ -397,25 +441,27 @@ func newHIDVolume(log librespot.Logger, conn *dbus.Conn, adapter dbus.ObjectPath
 	}
 	// an explicit resubscribe proves the knob works again
 	input.onStartNotify = func() { h.setSubDead(false) }
+	for _, c := range []*gattChar{pnp, hidInfo, reportMap} {
+		c := c
+		c.onRead = func() { h.markRead(c.uuid) }
+	}
+	input.descs[0].onRead = func() { h.markRead(uuidReportRef) }
 	return h, nil
 }
 
 // registers with bluez (via the reconciler goroutine) and launches the send app
-func (h *hidVolume) start(bondExists bool, onAdvUp func()) {
+func (h *hidVolume) start(onAdvUp func()) {
 	h.regMu.Lock()
-	h.bondGate = bondExists
 	h.onAdvUp = onAdvUp
 	h.regMu.Unlock()
-	if !bondExists {
-		h.log.Infof("bluetooth: hid: no phone bonded yet, volume-key advertisement gated until first pairing completes")
-	}
 	go h.reconcilerLoop()
 	go h.sendWorker()
 	h.poke()
 }
 
+// The controller cannot advertise at all while a phone holds an LE link
 func (h *hidVolume) advWantedLocked() bool {
-	return h.bondGate && !h.setupSuppress
+	return !h.closed
 }
 
 func (h *hidVolume) poke() {
@@ -511,115 +557,72 @@ func (h *hidVolume) reconcileLocked() bool {
 	return true
 }
 
-func (h *hidVolume) setBondGate(open bool) {
-	h.regMu.Lock()
-	if h.closed || h.bondGate == open {
-		h.regMu.Unlock()
-		return
-	}
-	h.bondGate = open
-	h.regMu.Unlock()
-	if open {
-		h.log.Infof("bluetooth: hid: phone bond present, volume-key advertisement enabled")
-	} else {
-		h.log.Infof("bluetooth: hid: no phone bonds left, volume-key advertisement gated")
-	}
-	h.poke()
-}
-
-// pauses the advertisement while the pairing screen is open
-func (h *hidVolume) setSetupSuppress(on bool) {
+// re-registers the advertisement after the last LE link drops
+func (h *hidVolume) forceAdvRefresh() {
 	h.regMu.Lock()
 	if h.closed {
 		h.regMu.Unlock()
 		return
 	}
-	if on {
-		if h.suppressTimer == nil {
-			h.suppressTimer = time.AfterFunc(hidSuppressTTL, h.suppressExpired)
-		} else {
-			h.suppressTimer.Reset(hidSuppressTTL)
-		}
-	} else if h.suppressTimer != nil {
-		h.suppressTimer.Stop()
-	}
-	changed := h.setupSuppress != on
-	h.setupSuppress = on
-	bonded := h.bondGate
-	h.regMu.Unlock()
-	if !changed {
-		return
-	}
-	if on {
-		h.log.Infof("bluetooth: hid: pairing screen open, pausing volume-key advertisement (single identity during setup)")
-	} else if bonded {
-		h.log.Infof("bluetooth: hid: pairing screen closed, resuming volume-key advertisement")
-	}
-	h.poke()
-}
-
-func (h *hidVolume) suppressExpired() {
-	h.regMu.Lock()
-	if h.closed || !h.setupSuppress {
+	if !h.advRegistered {
 		h.regMu.Unlock()
+		h.poke()
 		return
-	}
-	h.setupSuppress = false
-	h.regMu.Unlock()
-	h.log.Warn("bluetooth: hid: pairing-screen suppression expired without discover-off, resuming volume-key advertisement")
-	h.poke()
-}
-
-// drops and re-registers the advertisement to nudge a host
-func (h *hidVolume) cycleAdv() bool {
-	if h.battery.isNotifying() {
-		h.log.Debug("bluetooth: hid: skipping advertisement cycle while phone holds the LE link (re-register would be refused)")
-		return false
-	}
-	h.regMu.Lock()
-	if h.closed || !h.advRegistered {
-		h.regMu.Unlock()
-		return false
 	}
 	if err := h.bluezCall(leAdvManagerIface+".UnregisterAdvertisement", hidAdvPath); err != nil && !isBluezErr(err, "DoesNotExist") {
-		h.log.WithError(err).Debug("bluetooth: hid: advertisement unregister failed during cycle")
+		h.log.WithError(err).Debug("bluetooth: hid: advertisement unregister failed during refresh")
 		h.regMu.Unlock()
-		return false
+		return
 	}
 	h.advRegistered = false
 	h.regMu.Unlock()
+	h.log.Info("bluetooth: hid: le link down, rebuilding volume-key advertisement")
 
 	select {
 	case <-h.stop:
-		return false
+		return
 	case <-time.After(hidAdvCycleGap):
 	}
 	h.poke()
-	return true
 }
 
-// reregisters the GATT applicatio
-func (h *hidVolume) cycleApp() bool {
-	h.regMu.Lock()
-	if h.closed || !h.appRegistered {
-		h.regMu.Unlock()
-		return false
-	}
-	if err := h.bluezCall(gattManagerIface+".UnregisterApplication", hidAppPath); err != nil && !isBluezErr(err, "DoesNotExist") {
-		h.log.WithError(err).Debug("bluetooth: hid: gatt app unregister failed during cycle")
-		h.regMu.Unlock()
-		return false
-	}
-	h.appRegistered = false
-	h.regMu.Unlock()
+// records an emitted report
+func (h *hidVolume) noteSent() (int, bool) {
+	h.sentMu.Lock()
+	defer h.sentMu.Unlock()
+	h.sentReports++
+	return h.sentReports, h.sentReports == 1 || h.sentReports%50 == 0
+}
 
-	select {
-	case <-h.stop:
-		return false
-	case <-time.After(hidAdvCycleGap):
+func (h *hidVolume) sentCount() int {
+	h.sentMu.Lock()
+	defer h.sentMu.Unlock()
+	return h.sentReports
+}
+
+func (h *hidVolume) markRead(uuid string) {
+	h.readMu.Lock()
+	if h.charRead == nil {
+		h.charRead = make(map[string]bool)
 	}
-	h.poke()
-	return true
+	h.charRead[shortUUID(uuid)] = true
+	h.readMu.Unlock()
+}
+
+func (h *hidVolume) readSummary() string {
+	yn := func(ok bool) string {
+		if ok {
+			return "y"
+		}
+		return "n"
+	}
+	h.readMu.Lock()
+	var out []string
+	for _, u := range []string{"2a50", "2a4a", "2a4b", "2908"} {
+		out = append(out, u+"="+yn(h.charRead[u]))
+	}
+	h.readMu.Unlock()
+	return "hid attach since start: " + strings.Join(out, " ") + " notify=" + yn(h.input.isNotifying())
 }
 
 // flips whether knob sends should be reported as unusable
@@ -670,31 +673,10 @@ func (h *hidVolume) armSubscribeWatchdog(addr string, stillConnected func() bool
 		if !h.watchdogClaim(addr, time.Now()) {
 			return
 		}
-		var nudged bool
-		if h.battery.isNotifying() {
-			h.log.Warnf("bluetooth: hid: %s connected %.0fs without subscribing to volume keys, cycling gatt app to force re-discovery",
-				addr, hidSubscribeWatchdogDelay.Seconds())
-			nudged = h.cycleApp()
-		} else {
-			h.log.Warnf("bluetooth: hid: %s connected %.0fs without subscribing to volume keys, cycling advertisement to nudge it",
-				addr, hidSubscribeWatchdogDelay.Seconds())
-			nudged = h.cycleAdv()
-		}
-		if !nudged {
-			return
-		}
-
-		select {
-		case <-h.stop:
-			return
-		case <-time.After(hidSubscribeWatchdogDelay):
-		}
-		if h.input.isNotifying() {
-			h.log.Infof("bluetooth: hid: %s subscribed to volume keys after nudge", addr)
-		} else if stillConnected() {
-			h.log.Warnf("bluetooth: hid: %s still not subscribed to volume keys after nudge, reporting knob as unusable for this phone", addr)
-			h.setSubDead(true)
-		}
+		// Detection only
+		h.log.Warnf("bluetooth: hid: %s connected %.0fs without subscribing to volume keys, reporting knob as unusable for this phone (%s)",
+			addr, hidSubscribeWatchdogDelay.Seconds(), h.readSummary())
+		h.setSubDead(true)
 	}()
 }
 
@@ -707,16 +689,15 @@ func (h *hidVolume) clearWatchdog(addr string) {
 
 func (h *hidVolume) advState() string {
 	h.regMu.Lock()
-	defer h.regMu.Unlock()
+	app, adv := h.appRegistered, h.advRegistered
+	h.regMu.Unlock()
 	switch {
-	case !h.appRegistered:
+	case !app:
 		return "gatt service not registered"
-	case h.setupSuppress:
-		return "paused while pairing screen open"
-	case !h.bondGate:
-		return "waiting for first phone pairing"
-	case !h.advRegistered:
+	case !adv:
 		return "advertisement pending (bluez retry)"
+	case h.leLinkUp != nil && h.leLinkUp():
+		return "registered, not radiating (phone holds the LE link)"
 	default:
 		return "advertising"
 	}
@@ -726,18 +707,8 @@ func (h *hidVolume) advState() string {
 func (h *hidVolume) available() bool {
 	h.regMu.Lock()
 	registered := h.appRegistered
-	dead := h.subDead
 	h.regMu.Unlock()
-	if !registered {
-		return false
-	}
-	if h.input.isNotifying() {
-		return true
-	}
-	if dead {
-		return false
-	}
-	return h.peerConnected != nil && h.peerConnected()
+	return registered && h.input.isNotifying()
 }
 
 func (h *hidVolume) sendSteps(steps int) bool {
@@ -777,6 +748,9 @@ func (h *hidVolume) sendWorker() {
 					h.log.WithError(err).Debug("bluetooth: hid: volume release dropped")
 					break
 				}
+				if n, loud := h.noteSent(); loud {
+					h.log.Infof("bluetooth: hid: %d volume report(s) emitted (host subscribed=%v)", n, h.input.isNotifying())
+				}
 				if i < steps-1 {
 					time.Sleep(hidStepGap)
 				}
@@ -789,9 +763,6 @@ func (h *hidVolume) close() {
 	h.stopOnce.Do(func() { close(h.stop) })
 	h.regMu.Lock()
 	h.closed = true
-	if h.suppressTimer != nil {
-		h.suppressTimer.Stop()
-	}
 	adv, app := h.advRegistered, h.appRegistered
 	h.advRegistered, h.appRegistered = false, false
 	h.regMu.Unlock()
