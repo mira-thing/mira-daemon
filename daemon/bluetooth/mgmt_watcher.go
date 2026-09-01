@@ -14,7 +14,12 @@ const (
 	hciChannelControl = 3      // HCI_CHANNEL_CONTROL
 	hciDevNone        = 0xffff // HCI_DEV_NONE: events from all controllers
 
+	mgmtEvDeviceConnected    = 0x000B
 	mgmtEvDeviceDisconnected = 0x000C
+
+	mgmtAddrBREDR    = 0x00
+	mgmtAddrLEPublic = 0x01
+	mgmtAddrLERandom = 0x02
 
 	// mgmt-api.txt disconnect reasons
 	mgmtReasonUnknown = 0x00
@@ -100,7 +105,19 @@ func (m *Manager) watchMgmtDisconnects() error {
 				m.log.WithError(err).Warn("bluetooth: mgmt event socket died, disconnect reasons unavailable")
 				return
 			}
-			if addr, reason, ok := parseMgmtDisconnect(buf[:n]); ok {
+			opcode, addr, addrType, reason, ok := parseMgmtEvent(buf[:n])
+			if !ok {
+				continue
+			}
+			switch opcode {
+			case mgmtEvDeviceConnected:
+				if isLEAddrType(addrType) {
+					m.noteLELink(addr, true)
+				}
+			case mgmtEvDeviceDisconnected:
+				if isLEAddrType(addrType) {
+					m.noteLELink(addr, false)
+				}
 				m.handleDisconnectReason(addr, reason)
 			}
 		}
@@ -110,19 +127,37 @@ func (m *Manager) watchMgmtDisconnects() error {
 	return nil
 }
 
-// parseMgmtDisconnect decodes one mgmt event packet
-func parseMgmtDisconnect(buf []byte) (addr string, reason uint8, ok bool) {
+// parseMgmtEvent decodes one connect or disconnect mgmt event
+func parseMgmtEvent(buf []byte) (opcode uint16, addr string, addrType, reason uint8, ok bool) {
 	if len(buf) < 6 {
-		return "", 0, false
+		return 0, "", 0, 0, false
 	}
-	opcode := binary.LittleEndian.Uint16(buf[0:2])
+	opcode = binary.LittleEndian.Uint16(buf[0:2])
 	plen := int(binary.LittleEndian.Uint16(buf[4:6]))
-	if opcode != mgmtEvDeviceDisconnected || plen < 8 || len(buf) < 6+plen {
-		return "", 0, false
+	if len(buf) < 6+plen {
+		return 0, "", 0, 0, false
 	}
 	p := buf[6:]
+	switch opcode {
+	case mgmtEvDeviceConnected:
+		if plen < 7 {
+			return 0, "", 0, 0, false
+		}
+	case mgmtEvDeviceDisconnected:
+		if plen < 8 {
+			return 0, "", 0, 0, false
+		}
+		reason = p[7]
+	default:
+		return 0, "", 0, 0, false
+	}
 	addr = fmt.Sprintf("%02X:%02X:%02X:%02X:%02X:%02X", p[5], p[4], p[3], p[2], p[1], p[0])
-	return addr, p[7], true
+	return opcode, addr, p[6], reason, true
+}
+
+// LE Public and LE Random are the two LE transports; anything else is BR/EDR
+func isLEAddrType(t uint8) bool {
+	return t == mgmtAddrLEPublic || t == mgmtAddrLERandom
 }
 
 // mgmtReasonName is a human label for the coarse mgmt disconnect reason

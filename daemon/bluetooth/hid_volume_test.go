@@ -52,30 +52,17 @@ func TestWatchdogClaim_AddressesAreIndependent(t *testing.T) {
 	}
 }
 
-func TestAdvWanted_GatedWithoutBond(t *testing.T) {
+func TestAdvWanted_AlwaysOnUntilClosed(t *testing.T) {
 	t.Parallel()
 
+	// the controller only accepts LE Set Advertise Enable in the gaps between connection
 	h := &hidVolume{}
-	if h.advWantedLocked() {
-		t.Error("advertisement must stay down with no bond")
-	}
-}
-
-func TestAdvWanted_UpWithBond(t *testing.T) {
-	t.Parallel()
-
-	h := &hidVolume{bondGate: true}
 	if !h.advWantedLocked() {
-		t.Error("advertisement should be wanted once a bond exists")
+		t.Error("advertisement should be wanted whenever bluez will take it")
 	}
-}
-
-func TestAdvWanted_SetupSuppressWinsOverBond(t *testing.T) {
-	t.Parallel()
-
-	h := &hidVolume{bondGate: true, setupSuppress: true}
+	h.closed = true
 	if h.advWantedLocked() {
-		t.Error("open pairing screen must suppress the advertisement even with a bond")
+		t.Error("a closed hidVolume must not want an advertisement")
 	}
 }
 
@@ -88,32 +75,6 @@ func TestClearWatchdog_ResetsCooldown(t *testing.T) {
 	h.clearWatchdog("AA:BB:CC:DD:EE:FF")
 	if !h.watchdogClaim("AA:BB:CC:DD:EE:FF", now.Add(time.Second)) {
 		t.Error("claim after clearWatchdog should succeed")
-	}
-}
-
-func TestSuppressExpired_ClearsSuppressionOnce(t *testing.T) {
-	t.Parallel()
-
-	h := &hidVolume{log: &librespot.NullLogger{}, pokeCh: make(chan struct{}, 1), setupSuppress: true}
-	h.suppressExpired()
-	if h.setupSuppress {
-		t.Error("suppressExpired should clear setupSuppress")
-	}
-	select {
-	case <-h.pokeCh:
-	default:
-		t.Error("suppressExpired should poke the reconciler")
-	}
-	h.suppressExpired()
-}
-
-func TestSuppressExpired_NoOpWhenClosed(t *testing.T) {
-	t.Parallel()
-
-	h := &hidVolume{pokeCh: make(chan struct{}, 1), setupSuppress: true, closed: true}
-	h.suppressExpired()
-	if !h.setupSuppress {
-		t.Error("suppressExpired must not mutate state after close")
 	}
 }
 
@@ -141,10 +102,8 @@ func TestAdvState_ReasonStrings(t *testing.T) {
 		want string
 	}{
 		{"no app", &hidVolume{}, "gatt service not registered"},
-		{"setup open", &hidVolume{appRegistered: true, bondGate: true, setupSuppress: true}, "paused while pairing screen open"},
-		{"no bond", &hidVolume{appRegistered: true}, "waiting for first phone pairing"},
-		{"adv pending", &hidVolume{appRegistered: true, bondGate: true}, "advertisement pending (bluez retry)"},
-		{"advertising", &hidVolume{appRegistered: true, bondGate: true, advRegistered: true}, "advertising"},
+		{"adv pending", &hidVolume{appRegistered: true}, "advertisement pending (bluez retry)"},
+		{"advertising", &hidVolume{appRegistered: true, advRegistered: true}, "advertising"},
 	}
 	for _, c := range cases {
 		if got := c.h.advState(); got != c.want {
@@ -157,30 +116,12 @@ func newTestChar() *gattChar {
 	return &gattChar{log: &librespot.NullLogger{}}
 }
 
-func TestAvailable_ConnectedFallbackWhenNotDead(t *testing.T) {
+func TestAvailable_ConnectedPeerIsNotEnough(t *testing.T) {
 	t.Parallel()
 
-	h := &hidVolume{
-		appRegistered: true,
-		input:         newTestChar(),
-		peerConnected: func() bool { return true },
-	}
-	if !h.available() {
-		t.Error("connected peer without StartNotify should stay optimistic (silent CCC restore)")
-	}
-}
-
-func TestAvailable_SubDeadBlocksSends(t *testing.T) {
-	t.Parallel()
-
-	h := &hidVolume{
-		appRegistered: true,
-		subDead:       true,
-		input:         newTestChar(),
-		peerConnected: func() bool { return true },
-	}
+	h := &hidVolume{appRegistered: true, input: newTestChar()}
 	if h.available() {
-		t.Error("a nudge-proven dead subscription must report the knob unusable")
+		t.Error("a connected peer that never subscribed must not look usable")
 	}
 }
 
@@ -237,5 +178,40 @@ func TestClearWatchdog_ClearsSubDead(t *testing.T) {
 	h.regMu.Unlock()
 	if dead {
 		t.Error("bond removal must reset the dead flag")
+	}
+}
+
+func TestAvailable_RequiresRealSubscription(t *testing.T) {
+	t.Parallel()
+
+	h := &hidVolume{appRegistered: true, input: &gattChar{}}
+	if h.available() {
+		t.Error("must not report available before the host subscribes")
+	}
+	h.input.notifying = true
+	if !h.available() {
+		t.Error("should be available once the host subscribes")
+	}
+	h.appRegistered = false
+	if h.available() {
+		t.Error("must not report available with no gatt app registered")
+	}
+}
+
+func TestAdvState_LELinkUpIsNotAdvertising(t *testing.T) {
+	t.Parallel()
+
+	leUp := false
+	h := &hidVolume{
+		appRegistered: true,
+		advRegistered: true,
+		leLinkUp:      func() bool { return leUp },
+	}
+	if got := h.advState(); got != "advertising" {
+		t.Errorf("with no LE link want advertising, got %q", got)
+	}
+	leUp = true
+	if got := h.advState(); got != "registered, not radiating (phone holds the LE link)" {
+		t.Errorf("with an LE link the state must not claim to advertise, got %q", got)
 	}
 }

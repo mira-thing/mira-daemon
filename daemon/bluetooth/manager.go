@@ -66,6 +66,10 @@ type Manager struct {
 	connectedSince    map[string]time.Time
 	connectedNow      map[string]bool
 
+	// peers holding an LE link, keyed by address, from the mgmt socket
+	leLinksMu sync.Mutex
+	leLinks   map[string]bool
+
 	// most recent bnep0 (PAN) drop
 	networkDropMu     sync.Mutex
 	lastNetworkDropAt time.Time
@@ -155,7 +159,6 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 
 	m.monitorDisconnects()
 
-	hasBond := false
 	var connectedPaired []string
 	for attempt := 1; ; attempt++ {
 		devs, err := m.GetDevices()
@@ -164,13 +167,10 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 				time.Sleep(time.Second)
 				continue
 			}
-			m.log.WithError(err).Warn("bluetooth: startup device snapshot failed, HID advertisement stays gated until a pair/connect event")
+			m.log.WithError(err).Warn("bluetooth: startup device snapshot failed, no watchdogs armed for already-connected phones")
 			break
 		}
 		for _, d := range devs {
-			if d.Paired {
-				hasBond = true
-			}
 			if !d.Connected {
 				continue
 			}
@@ -193,8 +193,8 @@ func NewManager(log librespot.Logger, emit Emitter) (*Manager, error) {
 		log.WithError(err).Warn("bluetooth: hid: volume key service unavailable")
 	} else {
 		m.hid = hv
-		hv.peerConnected = m.anyDeviceConnected
-		hv.start(hasBond, m.sweepHIDWatchdogs)
+		hv.leLinkUp = m.anyLEConnected
+		hv.start(m.sweepHIDWatchdogs)
 		for _, addr := range connectedPaired {
 			m.armHIDWatchdog(addr)
 		}
@@ -320,9 +320,7 @@ func (m *Manager) handleDevicePaired(devicePath, address string) {
 	}
 	m.manualMu.Unlock()
 
-	// a completed bond ends the single identity setup window
 	if m.hid != nil {
-		m.hid.setBondGate(true)
 		m.armHIDWatchdog(address)
 	}
 
@@ -361,8 +359,6 @@ func (m *Manager) handleDeviceConnected(devicePath, address string) {
 	}
 
 	if m.hid != nil {
-		// a bonded phone connecting is proof a bond exists
-		m.hid.setBondGate(true)
 		// catches bonded hosts that connect but never subscribe to volume keys
 		m.armHIDWatchdog(address)
 	}
@@ -1005,11 +1001,36 @@ func (m *Manager) adapterAlias() string {
 	return "Mira"
 }
 
-// reports whether any peer currently holds an ACL link
-func (m *Manager) anyDeviceConnected() bool {
-	m.manualMu.Lock()
-	defer m.manualMu.Unlock()
-	return len(m.connectedNow) > 0
+// records an LE transport connect or disconnect seen on the mgmt socket
+func (m *Manager) noteLELink(address string, up bool) {
+	m.leLinksMu.Lock()
+	if m.leLinks == nil {
+		m.leLinks = make(map[string]bool)
+	}
+	if up {
+		m.leLinks[address] = true
+	} else {
+		delete(m.leLinks, address)
+	}
+	remaining := len(m.leLinks)
+	m.leLinksMu.Unlock()
+
+	state := "down"
+	if up {
+		state = "up"
+	}
+	m.log.Debugf("bluetooth: le link %s %s (%d still up)", address, state, remaining)
+
+	if !up && remaining == 0 && m.hid != nil {
+		go m.hid.forceAdvRefresh()
+	}
+}
+
+// reports whether any peer holds an LE link
+func (m *Manager) anyLEConnected() bool {
+	m.leLinksMu.Lock()
+	defer m.leLinksMu.Unlock()
+	return len(m.leLinks) > 0
 }
 
 // queues a signed volume key event
@@ -1050,6 +1071,14 @@ func (m *Manager) HIDVolumeStatus() (registered, subscribed, subDead bool) {
 	subDead = h.subDead
 	h.regMu.Unlock()
 	return registered, h.input.isNotifying(), subDead
+}
+
+// counts volume reports emitted since start
+func (m *Manager) HIDVolumeSent() int {
+	if m == nil || m.hid == nil {
+		return 0
+	}
+	return m.hid.sentCount()
 }
 
 // explains the advertisement state for the debug screen
@@ -1136,11 +1165,6 @@ func (m *Manager) SetDiscoverable(enable bool) error {
 	if err := m.dbusCall(obj, "org.freedesktop.DBus.Properties.Set",
 		bluezAdapterInterface, "Pairable", dbus.MakeVariant(enable)).Err; err != nil {
 		return fmt.Errorf("set Pairable=%v: %w", enable, err)
-	}
-
-	// while the pairing screen is up the phone must only see one identity
-	if m.hid != nil {
-		m.hid.setSetupSuppress(enable)
 	}
 
 	m.log.Infof("bluetooth: discoverable=%v pairable=%v timeout=%d", enable, enable, timeout)
@@ -1269,32 +1293,8 @@ func (m *Manager) RemoveDevice(address string) error {
 
 	if m.hid != nil {
 		m.hid.clearWatchdog(address)
-		go m.refreshHIDBondGate()
 	}
 	return nil
-}
-
-// derives the HID advertising gate from BlueZ bond state
-func (m *Manager) refreshHIDBondGate() {
-	var devs []DeviceInfo
-	var err error
-	for attempt := 1; attempt <= 2; attempt++ {
-		if devs, err = m.GetDevices(); err == nil {
-			break
-		}
-		time.Sleep(time.Second)
-	}
-	if err != nil {
-		m.log.WithError(err).Warn("bluetooth: hid: bond-gate refresh failed, leaving advertising gate unchanged")
-		return
-	}
-	for _, d := range devs {
-		if d.Paired {
-			m.hid.setBondGate(true)
-			return
-		}
-	}
-	m.hid.setBondGate(false)
 }
 
 // arms the subscription watchdog for every connected paired phone
@@ -1451,11 +1451,6 @@ func (m *Manager) connectNetworkInternal(address string, force bool) error {
 	m.clearManualDisconnect(address)
 	m.clearPanBackoffPause(address)
 	m.setPanSessionUp(address)
-
-	// tether has been up once -> setup is done, volume keys may advertise
-	if m.hid != nil {
-		m.hid.setBondGate(true)
-	}
 
 	go func() {
 		var name string
