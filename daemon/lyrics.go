@@ -143,12 +143,14 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 
 	var result, firstUnsynced *LyricsResult
 	var sawTransientError bool
+	failedSources := make([]string, 0, len(lp.sources))
 	for _, src := range lp.sources {
 		res, err := src.fetch(ctx, q)
 		if err != nil {
 			// ErrNoLyrics means the source has nothing for this track
 			if !errors.Is(err, ErrNoLyrics) {
 				sawTransientError = true
+				failedSources = append(failedSources, src.name())
 			}
 			lp.log.Debugf("lyrics: %s failed: %v", src.name(), err)
 			continue
@@ -175,6 +177,9 @@ func (lp *LyricsProvider) FetchLyrics(ctx context.Context, trackId, trackName, a
 			lp.storeLocked(key, nil)
 			lp.mu.Unlock()
 			lp.log.Debugf("lyrics: confirmed none for %q by %q, caching negative", trackName, artistName)
+		}
+		if sawTransientError {
+			lp.log.Warnf("lyrics: fallback exhausted for %q by %q (failed providers: %s)", trackName, artistName, strings.Join(failedSources, ", "))
 		}
 		return nil, ErrNoLyrics
 	}
@@ -526,6 +531,11 @@ func parseEpisodeText(body []byte) (*LyricsResult, error) {
 // how long to skip the secondary source after a rate-limit
 const secondaryCooldown = 60 * time.Second
 
+const secondaryTokenTTL = 50 * time.Second
+
+// How long to skip it after the provider refuses to mint a usertoken
+const secondaryTokenRefusedCooldown = 30 * time.Minute
+
 type secondaryLyricProvider struct {
 	log    librespot.Logger
 	client *http.Client
@@ -533,9 +543,13 @@ type secondaryLyricProvider struct {
 	tokenURL    string
 	subtitleURL string
 	appID       string
-	origin      string
-	referer     string
 	subtitleFmt string
+
+	userAgent        string
+	appVersionHeader string
+	appVersion       string
+	cookieHeader     string
+	cookieValue      string
 
 	mu            sync.Mutex
 	tok           string
@@ -554,28 +568,32 @@ func newSecondaryLyricProvider(logger librespot.Logger) *secondaryLyricProvider 
 			Timeout: 10 * time.Second,
 			Jar:     jar,
 		},
-		tokenURL:    os.Getenv("THING_LP_TOKEN_URL"),
-		subtitleURL: os.Getenv("THING_LP_SUBTITLE_URL"),
-		appID:       os.Getenv("THING_LP_APP_ID"),
-		origin:      os.Getenv("THING_LP_ORIGIN"),
-		referer:     os.Getenv("THING_LP_REFERER"),
-		subtitleFmt: os.Getenv("THING_LP_SUBTITLE_FORMAT"),
+		tokenURL:         os.Getenv("THING_LP_TOKEN_URL"),
+		subtitleURL:      os.Getenv("THING_LP_SUBTITLE_URL"),
+		appID:            os.Getenv("THING_LP_APP_ID"),
+		subtitleFmt:      os.Getenv("THING_LP_SUBTITLE_FORMAT"),
+		userAgent:        os.Getenv("THING_LP_SECONDARY_USER_AGENT"),
+		appVersionHeader: os.Getenv("THING_LP_SECONDARY_APP_VERSION_HEADER"),
+		appVersion:       os.Getenv("THING_LP_SECONDARY_APP_VERSION"),
+		cookieHeader:     os.Getenv("THING_LP_SECONDARY_COOKIE_HEADER"),
+		cookieValue:      os.Getenv("THING_LP_SECONDARY_COOKIE"),
 	}
 }
 
 func (s *secondaryLyricProvider) name() string { return "secondary" }
 
 func (s *secondaryLyricProvider) addHeaders(req *http.Request) {
-	// browser header
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
+	if s.userAgent != "" {
+		req.Header.Set("X-User-Agent", s.userAgent)
+	}
+	if s.appVersionHeader != "" && s.appVersion != "" {
+		req.Header.Set(s.appVersionHeader, s.appVersion)
+	}
+	if s.cookieHeader != "" && s.cookieValue != "" {
+		req.Header.Set(s.cookieHeader, s.cookieValue)
+	}
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	if s.origin != "" {
-		req.Header.Set("Origin", s.origin)
-	}
-	if s.referer != "" {
-		req.Header.Set("Referer", s.referer)
-	}
 }
 
 func (s *secondaryLyricProvider) getToken(ctx context.Context) (string, error) {
@@ -624,15 +642,49 @@ func (s *secondaryLyricProvider) getToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("parsing token response: %w", err)
 	}
 
-	if tokenResp.Message.Header.StatusCode != 200 || tokenResp.Message.Body.UserToken == "" {
-		return "", fmt.Errorf("secondary returned status %d or empty token", tokenResp.Message.Header.StatusCode)
+	statusCode := tokenResp.Message.Header.StatusCode
+	tok := tokenResp.Message.Body.UserToken
+	if resp.StatusCode == 401 || resp.StatusCode == 403 || statusCode == 401 || statusCode == 403 || (statusCode == 200 && tok == "") {
+		s.tok = ""
+		s.exp = time.Time{}
+		s.cooldownUntil = time.Now().Add(secondaryTokenRefusedCooldown)
+	}
+	if statusCode != 200 || tok == "" {
+		return "", fmt.Errorf("secondary returned status %d or empty token", statusCode)
 	}
 
-	s.tok = tokenResp.Message.Body.UserToken
-	s.exp = time.Now().Add(8 * time.Minute)
+	// did provider act like tokenw as accepted but gives us bad lyric data
+	if isNullToken(tok) {
+		s.cooldownUntil = time.Now().Add(secondaryTokenRefusedCooldown)
+		s.tok = ""
+		s.exp = time.Time{}
+		return "", errors.New("secondary refused a usertoken (null token), backing off")
+	}
+
+	s.tok = tok
+	s.exp = time.Now().Add(secondaryTokenTTL)
 
 	s.log.Debugf("lyrics: acquired new secondary token")
 	return s.tok, nil
+}
+
+// A usertoken of nothing but zeros is the provider declining
+func isNullToken(tok string) bool {
+	for _, c := range tok {
+		if c != '0' {
+			return false
+		}
+	}
+	return true
+}
+
+var errSecondaryUnauthorized = errors.New("secondary unauthorized")
+
+func (s *secondaryLyricProvider) clearToken() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tok = ""
+	s.exp = time.Time{}
 }
 
 func (s *secondaryLyricProvider) invalidateToken() {
@@ -656,6 +708,21 @@ func (s *secondaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*Lyr
 		return nil, errors.New("secondary cooling down after auth/rate-limit error")
 	}
 
+	res, err := s.attempt(ctx, q)
+	if !errors.Is(err, errSecondaryUnauthorized) {
+		return res, err
+	}
+
+	s.log.Debugf("lyrics: secondary 401/403, retrying with a fresh token")
+	s.clearToken()
+	res, err = s.attempt(ctx, q)
+	if errors.Is(err, errSecondaryUnauthorized) {
+		s.invalidateToken()
+	}
+	return res, err
+}
+
+func (s *secondaryLyricProvider) attempt(ctx context.Context, q lyricsQuery) (*LyricsResult, error) {
 	token, err := s.getToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting secondary token: %w", err)
@@ -699,8 +766,7 @@ func (s *secondaryLyricProvider) fetch(ctx context.Context, q lyricsQuery) (*Lyr
 	}
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		s.invalidateToken()
-		return nil, fmt.Errorf("secondary auth error (status %d), token invalidated", resp.StatusCode)
+		return nil, fmt.Errorf("secondary auth error (status %d): %w", resp.StatusCode, errSecondaryUnauthorized)
 	}
 
 	return s.parseResponse(body)
@@ -732,7 +798,7 @@ func (s *secondaryLyricProvider) parseResponse(body []byte) (*LyricsResult, erro
 	if msg.Header.StatusCode != 200 {
 		// provider signals a dead/rate-limited token via the in-body status_code
 		if msg.Header.StatusCode == 401 || msg.Header.StatusCode == 403 {
-			s.invalidateToken()
+			return nil, fmt.Errorf("secondary status %d: %w", msg.Header.StatusCode, errSecondaryUnauthorized)
 		}
 		return nil, fmt.Errorf("secondary status %d", msg.Header.StatusCode)
 	}
