@@ -1280,7 +1280,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if data.Uri == "" {
 			return nil, fmt.Errorf("play requires a context uri")
 		}
-		cmd := buildPlayCommand(data)
+		cmd := buildPlayCommand(data, p.sess.Username())
 		shuf := "inherit"
 		if data.Shuffle != nil {
 			shuf = fmt.Sprintf("%v", *data.Shuffle)
@@ -1288,7 +1288,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		// TEMP diagnostic logging while verifying the play envelope on hardware.
 		// which envelope went out is otherwise invisible on device.
 		p.app.log.Infof("play: context=%s skipTo=%q shuffle=%s dj=%v -> active device",
-			data.Uri, data.SkipToUri, shuf, data.Uri == djContextUri)
+			cmd.Context.Uri, data.SkipToUri, shuf, data.Uri == djContextUri)
 		return nil, p.sendActiveDeviceCommand(ctx, cmd)
 
 	case ApiRequestTypeSearch:
@@ -1344,12 +1344,18 @@ const djContextResolveUrl = "hm://lexicon-session-provider/context-resolve/v2/se
 
 // buildPlayCommand turns a play request into the connect command for it. Pure, so the envelope
 // can be pinned by a test without a session.
-func buildPlayCommand(data ApiRequestDataPlay) connectCommand {
+func buildPlayCommand(data ApiRequestDataPlay, username string) connectCommand {
+	uri := data.Uri
+	// the library alias is not a playable context: the device accepts it, then clears
+	// the track. Only the account's own collection resolves.
+	if uri == likedCollectionUri && username != "" {
+		uri = "spotify:user:" + username + ":collection"
+	}
 	cmd := connectCommand{
 		Endpoint: "play",
 		Context: &connectContext{
-			Uri: data.Uri,
-			Url: "context://" + data.Uri,
+			Uri: uri,
+			Url: "context://" + uri,
 		},
 		Options: &connectOptions{License: "tft"},
 		PlayOrigin: &connectOrigin{
