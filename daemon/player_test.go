@@ -56,9 +56,10 @@ func TestBuildPlayCommand(t *testing.T) {
 		`"logging_params":{"page_instance_ids":[],"interaction_ids":[],"command_id":""}}`
 
 	tests := []struct {
-		name string
-		in   ApiRequestDataPlay
-		want string
+		name     string
+		in       ApiRequestDataPlay
+		username string
+		want     string
 	}{
 		{
 			name: "dj_uri_resolves_through_the_lexicon_provider",
@@ -106,12 +107,31 @@ func TestBuildPlayCommand(t *testing.T) {
 				`"player_options_override":{"shuffling_context":true}},` +
 				wantOrigin,
 		},
+		{
+			name:     "liked_songs_resolves_against_the_account",
+			in:       ApiRequestDataPlay{Uri: likedCollectionUri},
+			username: "someone",
+			want: `{"endpoint":"play","context":{"uri":"spotify:user:someone:collection",` +
+				`"url":"context://spotify:user:someone:collection","metadata":{}},` +
+				`"options":{"license":"tft","skip_to":{},"player_options_override":{}},` +
+				wantOrigin,
+		},
+		{
+			// a play before the session reports a user: sending spotify:user::collection
+			// would be worse than the alias it was asked for
+			name: "liked_songs_left_alone_without_a_username",
+			in:   ApiRequestDataPlay{Uri: likedCollectionUri},
+			want: `{"endpoint":"play","context":{"uri":"spotify:collection:tracks",` +
+				`"url":"context://spotify:collection:tracks","metadata":{}},` +
+				`"options":{"license":"tft","skip_to":{},"player_options_override":{}},` +
+				wantOrigin,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			cmd := buildPlayCommand(tt.in)
+			cmd := buildPlayCommand(tt.in, tt.username)
 			// randomCommandId makes the envelope unstable, so blank it and pin the rest
 			if cmd.LoggingParams != nil {
 				cmd.LoggingParams.CommandId = ""
