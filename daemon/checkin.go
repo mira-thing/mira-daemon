@@ -92,8 +92,8 @@ func normalizeVersion(v string) string {
 }
 
 func versionLess(a, b string) bool {
-	pa, oka := parseVersionParts(a)
-	pb, okb := parseVersionParts(b)
+	pa, prea, oka := parseVersionParts(a)
+	pb, preb, okb := parseVersionParts(b)
 	if !oka || !okb {
 		return false
 	}
@@ -102,24 +102,31 @@ func versionLess(a, b string) bool {
 			return pa[i] < pb[i]
 		}
 	}
-	return false
+	// a beta ranks below its own release so it still gets offered
+	return prea && !preb
 }
 
-func parseVersionParts(v string) ([3]int, bool) {
+// numeric parts, whether a prerelease suffix was present, and whether it parsed at all
+func parseVersionParts(v string) ([3]int, bool, bool) {
 	var out [3]int
 	if v == "" {
-		return out, false
+		return out, false, false
 	}
+	pre := false
 	parts := strings.SplitN(v, ".", 3)
 	for i, p := range parts {
-		p, _, _ = strings.Cut(p, "-")
+		var found bool
+		p, _, found = strings.Cut(p, "-")
+		if found {
+			pre = true
+		}
 		n, err := strconv.Atoi(p)
 		if err != nil || n < 0 {
-			return out, false
+			return out, false, false
 		}
 		out[i] = n
 	}
-	return out, true
+	return out, pre, true
 }
 
 func checkinConsentFromSettings(body []byte) string {
