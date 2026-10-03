@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -122,6 +123,15 @@ func firmwareVersion() string {
 	}
 	return strings.TrimSpace(string(b))
 }
+
+// rewritten on every flash so ui can tell apart flash and reboot
+var flashID = sync.OnceValue(func() string {
+	b, err := os.ReadFile("/var/local/mira/flash_id")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+})
 
 // reports which interface actually carries internet
 func networkPathAndIP() (path, ip string) {
