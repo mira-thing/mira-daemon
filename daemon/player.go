@@ -1133,6 +1133,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 				"latest_highlights": p.app.latestHighlights(),
 				"update_available":  p.app.updateAvailable(),
 				"update_mandatory":  p.app.updateMandatory(),
+				"flash_id":          flashID(),
 			}
 			if setupProgress != nil {
 				resp["setting_up_progress"] = setupProgress
@@ -1189,6 +1190,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			"latest_highlights": p.app.latestHighlights(),
 			"update_available":  p.app.updateAvailable(),
 			"update_mandatory":  p.app.updateMandatory(),
+			"flash_id":          flashID(),
 		}
 		if setupProgress != nil {
 			resp["setting_up_progress"] = setupProgress
