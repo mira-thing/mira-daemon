@@ -196,6 +196,8 @@ const (
 	ApiRequestTypePlay                ApiRequestType = "play"
 	ApiRequestTypeSearch              ApiRequestType = "search"
 	ApiRequestTypeCatalogPage         ApiRequestType = "catalog_page"
+	ApiRequestTypeLibraryPlaylists    ApiRequestType = "library_playlists"
+	ApiRequestTypeLibraryPlaylist     ApiRequestType = "library_playlist"
 	ApiRequestTypeResumeLast          ApiRequestType = "resume_last"
 	ApiRequestTypeGetVolume           ApiRequestType = "get_volume"
 	ApiRequestTypeSetVolume           ApiRequestType = "set_volume"
@@ -1213,6 +1215,7 @@ func (s *ConcreteApiServer) serve() {
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeToken}, w)
 	})
+	s.registerLibraryRoutes(m)
 	registerBluetoothRoutes(s.log, m, s.getBluetoothHandler)
 
 	// factory reset, 200 + flush first so the frontend gets a clean response before reboot

@@ -77,6 +77,9 @@ type AppPlayer struct {
 	metaResolvedCh       chan resolvedTrackMeta
 	metaResolveInFlight  string
 	metaResolveFailedUri string
+
+	// libraryRemintAt is the UnixNano of the last forced remint from a /library route
+	libraryRemintAt atomic.Int64
 }
 
 type resolvedTrackMeta struct {
@@ -1304,6 +1307,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		data, _ := req.Data.(ApiRequestDataCatalogPage)
 		return p.catalogPage(ctx, data)
 
+	case ApiRequestTypeLibraryPlaylists:
+		data, _ := req.Data.(ApiRequestDataLibraryPage)
+		return p.libraryPlaylists(ctx, data)
+
+	case ApiRequestTypeLibraryPlaylist:
+		data, _ := req.Data.(ApiRequestDataLibraryPage)
+		return p.libraryPlaylist(ctx, data)
+
 	case ApiRequestTypeAddToQueue:
 		uri, _ := req.Data.(string)
 		if uri == "" {
@@ -1738,6 +1749,11 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 			// having it inlione stalls this loop that keeps the dealer keepalive/messages
 			if req.Type == ApiRequestTypeLyrics {
 				p.handleLyricsAsync(ctx, req)
+				continue
+			}
+			// Pathfinder pages can take seconds too, and touch no player state
+			if req.Type == ApiRequestTypeLibraryPlaylists || req.Type == ApiRequestTypeLibraryPlaylist {
+				go func() { req.Reply(p.handleApiRequest(ctx, req)) }()
 				continue
 			}
 			data, err := p.handleApiRequest(ctx, req)
