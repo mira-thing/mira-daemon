@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 	"github.com/devgianlu/go-librespot/spclient"
 )
 
-// queueResolver lazily fills artist/album on queue tracks that ship with only uri + image
+// queueResolver lazily fills name/artist/album/cover on queue tracks that ship with only a uri
 type queueResolver struct {
 	log      librespot.Logger
 	spclient *spclient.Spclient
@@ -26,6 +27,31 @@ type resolvedQueueTrack struct {
 	name   string
 	artist string
 	album  string
+	image  string
+}
+
+// queue rows are list thumbnails, SMALL is the 64px cover
+const queueImageSize = "small"
+
+func queueTrackComplete(t QueueTrack) bool {
+	return t.Name != "" && t.Artist != "" && t.Album != "" && t.ImageUrl != ""
+}
+
+// resolvedFromMetadata pulls the queue row fields out of a TRACK_V4 extension
+func resolvedFromMetadata(track *metadatapb.Track) resolvedQueueTrack {
+	var e resolvedQueueTrack
+	e.name = track.GetName()
+	if len(track.Artist) > 0 {
+		e.artist = track.Artist[0].GetName()
+	}
+	if alb := track.Album; alb != nil {
+		e.album = alb.GetName()
+		e.image = coverImageUrl(alb.Cover, queueImageSize)
+		if e.image == "" && alb.CoverGroup != nil {
+			e.image = coverImageUrl(alb.CoverGroup.Image, queueImageSize)
+		}
+	}
+	return e
 }
 
 func newQueueResolver(log librespot.Logger, sp *spclient.Spclient, notify chan struct{}) *queueResolver {
@@ -46,8 +72,8 @@ func (r *queueResolver) applyCache(tracks []QueueTrack) (needsResolve []string) 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for i := range tracks {
-		complete := tracks[i].Name != "" && tracks[i].Artist != "" && tracks[i].Album != ""
-		if complete {
+		// TRACK_V4 can't answer episodes or local files, so asking would repeat on every update
+		if queueTrackComplete(tracks[i]) || !strings.HasPrefix(tracks[i].Uri, "spotify:track:") {
 			continue
 		}
 		if v, ok := r.cache[tracks[i].Uri]; ok {
@@ -60,13 +86,15 @@ func (r *queueResolver) applyCache(tracks []QueueTrack) (needsResolve []string) 
 			if tracks[i].Album == "" {
 				tracks[i].Album = v.album
 			}
-		}
-		// still missing after cache hit, schedule a fetch + skip in-flight URIs
-		if tracks[i].Name == "" || tracks[i].Artist == "" || tracks[i].Album == "" {
-			if _, p := r.pending[tracks[i].Uri]; !p {
-				r.pending[tracks[i].Uri] = struct{}{}
-				needsResolve = append(needsResolve, tracks[i].Uri)
+			if tracks[i].ImageUrl == "" {
+				tracks[i].ImageUrl = v.image
 			}
+			// a cached entry is everything TRACK_V4 has, refetching won't fill the gaps
+			continue
+		}
+		if _, p := r.pending[tracks[i].Uri]; !p {
+			r.pending[tracks[i].Uri] = struct{}{}
+			needsResolve = append(needsResolve, tracks[i].Uri)
 		}
 	}
 	return needsResolve
@@ -121,8 +149,23 @@ func (r *queueResolver) resolve(uris []string) {
 		return
 	}
 
-	resolved := 0
+	resolved := r.store(resp)
+	r.log.Debugf("queue resolver: resolved %d/%d tracks", resolved, len(uris))
+
+	if resolved == 0 {
+		return
+	}
+	// non-blocking signal, the daemon will re-emit observer state on receipt
+	select {
+	case r.notify <- struct{}{}:
+	default:
+	}
+}
+
+// store caches every non-empty TRACK_V4 entity in resp, including ones with no cover, and returns how many it cached
+func (r *queueResolver) store(resp *extmetadatapb.BatchedExtensionResponse) (resolved int) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, item := range resp.ExtendedMetadata {
 		for _, ext := range item.ExtensionData {
 			if ext.Header == nil || ext.Header.StatusCode != 200 {
@@ -132,17 +175,8 @@ func (r *queueResolver) resolve(uris []string) {
 			if err := ext.ExtensionData.UnmarshalTo(&track); err != nil {
 				continue
 			}
-			var entry resolvedQueueTrack
-			if track.Name != nil {
-				entry.name = *track.Name
-			}
-			if len(track.Artist) > 0 && track.Artist[0].Name != nil {
-				entry.artist = *track.Artist[0].Name
-			}
-			if track.Album != nil && track.Album.Name != nil {
-				entry.album = *track.Album.Name
-			}
-			if entry.name == "" && entry.artist == "" && entry.album == "" {
+			entry := resolvedFromMetadata(&track)
+			if entry == (resolvedQueueTrack{}) {
 				continue
 			}
 			r.cache[ext.EntityUri] = entry
@@ -160,16 +194,5 @@ func (r *queueResolver) resolve(uris []string) {
 			n--
 		}
 	}
-	r.mu.Unlock()
-
-	r.log.Debugf("queue resolver: resolved %d/%d tracks", resolved, len(uris))
-
-	if resolved == 0 {
-		return
-	}
-	// non-blocking signal, the daemon will re-emit observer state on receipt
-	select {
-	case r.notify <- struct{}{}:
-	default:
-	}
+	return resolved
 }
