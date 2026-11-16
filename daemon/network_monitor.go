@@ -1,9 +1,7 @@
 package daemon
 
 import (
-	"context"
 	"net"
-	"os/exec"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -11,19 +9,47 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 )
 
-// pinged once a second to test internet reachability
-const networkMonitorTarget = "1.1.1.1"
-
 // linkUp reports whether a network interface exists and is up
 func linkUp(name string) bool {
 	link, err := netlink.LinkByName(name)
-	return err == nil && link.Attrs().Flags&net.FlagUp != 0
+	if err != nil {
+		return false
+	}
+	attrs := link.Attrs()
+	return attrs.Flags&net.FlagUp != 0 && attrs.OperState != netlink.OperDown
 }
 
-// startNetworkMonitor pings + emits network_status on transition
+// hasDefaultRoute reports whether an IPv4 default route exists
+func hasDefaultRoute() bool {
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		return false
+	}
+	for _, r := range routes {
+		if r.Dst == nil && r.Gw != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// isOnlinePassive performs a passive local check of network availability
+// without generating outbound ICMP or packet traffic over the USB NDIS bridge.
+func isOnlinePassive() bool {
+	// Check if any primary network interface (USB RNDIS/ECM or Bluetooth PAN) is UP
+	if !linkUp("usb0") && !linkUp("usb1") && !linkUp("bnep0") {
+		return false
+	}
+	// Interface is UP; confirm routing or carrier readiness
+	return hasDefaultRoute() || linkUp("usb0") || linkUp("bnep0")
+}
+
+// startNetworkMonitor monitors network availability passively and emits network_status on transition.
+// Using passive local interface and routing checks eliminates the 1-second ICMP ping loop,
+// completely avoiding winnat.sys DPC latency spikes on the Windows host.
 func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition func(online bool)) {
 	const (
-		interval       = 1 * time.Second
+		interval       = 2 * time.Second
 		failThreshold  = 3
 		rebroadcastSec = 15
 	)
@@ -35,22 +61,6 @@ func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition fu
 			emitted       bool
 			tickSinceEmit int
 		)
-
-		ping := func() bool {
-			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "1", networkMonitorTarget)
-			return cmd.Run() == nil
-		}
-
-		confirm := func() bool {
-			conn, err := net.DialTimeout("tcp", networkMonitorTarget+":443", 1200*time.Millisecond)
-			if err != nil {
-				return false
-			}
-			_ = conn.Close()
-			return true
-		}
 
 		emit := func(status string) {
 			server.Emit(&ApiEvent{
@@ -65,16 +75,13 @@ func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition fu
 		}
 
 		for {
-			ok := ping()
-			if !ok {
-				ok = confirm()
-			}
+			ok := isOnlinePassive()
 			if ok {
 				failCount = 0
 				if !online || !emitted {
 					online = true
 					emitted = true
-					log.Info("network: online")
+					log.Info("network: online (passive local check)")
 					emit("online")
 					if onTransition != nil {
 						onTransition(true)
@@ -85,7 +92,7 @@ func startNetworkMonitor(log librespot.Logger, server ApiServer, onTransition fu
 				if failCount >= failThreshold && (online || !emitted) {
 					online = false
 					emitted = true
-					log.Warn("network: offline")
+					log.Warn("network: offline (all interfaces down)")
 					emit("offline")
 					if onTransition != nil {
 						onTransition(false)
