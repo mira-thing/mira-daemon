@@ -1786,8 +1786,9 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest) {
 				updated := *rs
 				updated.NextTracks = append([]QueueTrack(nil), rs.NextTracks...)
 				updated.PrevTracks = append([]QueueTrack(nil), rs.PrevTracks...)
-				p.queueResolver.applyCache(updated.NextTracks)
-				p.queueResolver.applyCache(updated.PrevTracks)
+				needNext := p.queueResolver.applyCache(updated.NextTracks)
+				needPrev := p.queueResolver.applyCache(updated.PrevTracks)
+				p.queueResolver.ResolveAsync(append(needNext, needPrev...))
 				updated.Position = updated.RemotePosition()
 				p.state.remoteState = &updated
 				p.app.server.Emit(&ApiEvent{
