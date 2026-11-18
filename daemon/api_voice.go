@@ -140,62 +140,35 @@ func (p *AppPlayer) pfBody(op string, vars map[string]any) []byte {
 }
 
 func (p *AppPlayer) libraryTracksPage(ctx context.Context, offset, limit int, force bool) (items []catalogItem, total int, err error) {
-	body := p.pfBody("fetchLibraryTracks", map[string]any{"offset": offset, "limit": limit})
-	data, err := p.pathfinderQueryEx(ctx, body, force)
+	tracks, pg, err := p.likedTracks(ctx, offset, limit, force)
 	if err != nil {
 		return nil, 0, err
 	}
-	var r struct {
-		Data struct {
-			Me struct {
-				Library struct {
-					Tracks struct {
-						TotalCount int `json:"totalCount"`
-						Items      []struct {
-							Track struct {
-								Uri  string `json:"_uri"`
-								Data struct {
-									Name    string `json:"name"`
-									Uri     string `json:"uri"`
-									Artists struct {
-										Items []struct {
-											Profile struct {
-												Name string `json:"name"`
-											} `json:"profile"`
-										} `json:"items"`
-									} `json:"artists"`
-								} `json:"data"`
-							} `json:"track"`
-						} `json:"items"`
-					} `json:"tracks"`
-				} `json:"library"`
-			} `json:"me"`
-		} `json:"data"`
+	return tracksToCatalog(tracks), pg.Total, nil
+}
+
+func (p *AppPlayer) likedTracks(ctx context.Context, offset, limit int, force bool) ([]libraryTrack, pfPage, error) {
+	body := p.pfBody("fetchLibraryTracks", map[string]any{"offset": offset, "limit": limit})
+	data, err := p.pathfinderQueryEx(ctx, body, force)
+	if err != nil {
+		return nil, pfPage{}, err
 	}
-	if err := json.Unmarshal(data, &r); err != nil {
-		return nil, 0, err
-	}
-	tr := r.Data.Me.Library.Tracks
-	for _, it := range tr.Items {
-		d := it.Track.Data
-		if d.Name == "" {
-			continue
-		}
-		uri := d.Uri
-		if uri == "" {
-			uri = it.Track.Uri
-		}
-		var artist string
-		if len(d.Artists.Items) > 0 {
-			artist = d.Artists.Items[0].Profile.Name
-		}
-		items = append(items, catalogItem{Name: d.Name, Artist: artist, Uri: uri})
-	}
-	return items, tr.TotalCount, nil
+	return parseLibraryTracks(data)
 }
 
 // fetches one page of the libraryV3 list filtered to a single entity type
 func (p *AppPlayer) libraryV3Page(ctx context.Context, filter string, offset, limit int, force bool) (items []catalogItem, total int, err error) {
+	entries, pg, err := p.libraryV3Entries(ctx, filter, offset, limit, force)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, e := range entries {
+		items = append(items, e.catalog())
+	}
+	return items, pg.Total, nil
+}
+
+func (p *AppPlayer) libraryV3Entries(ctx context.Context, filter string, offset, limit int, force bool) ([]libraryEntry, pfPage, error) {
 	body := p.pfBody("libraryV3", map[string]any{
 		"filters":                      []string{filter},
 		"order":                        nil,
@@ -210,111 +183,30 @@ func (p *AppPlayer) libraryV3Page(ctx context.Context, filter string, offset, li
 	})
 	data, err := p.pathfinderQueryEx(ctx, body, force)
 	if err != nil {
-		return nil, 0, err
+		return nil, pfPage{}, err
 	}
-	var r struct {
-		Data struct {
-			Me struct {
-				LibraryV3 struct {
-					TotalCount int `json:"totalCount"`
-					Items      []struct {
-						Item struct {
-							Data struct {
-								Typename string `json:"__typename"`
-								Uri      string `json:"uri"`
-								Name     string `json:"name"`
-								Artists  struct {
-									Items []struct {
-										Profile struct {
-											Name string `json:"name"`
-										} `json:"profile"`
-									} `json:"items"`
-								} `json:"artists"`
-							} `json:"data"`
-							URI string `json:"_uri"`
-						} `json:"item"`
-					} `json:"items"`
-				} `json:"libraryV3"`
-			} `json:"me"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(data, &r); err != nil {
-		return nil, 0, err
-	}
-	lib := r.Data.Me.LibraryV3
-	for _, it := range lib.Items {
-		d := it.Item.Data
-		uri := d.Uri
-		if uri == "" {
-			uri = it.Item.URI
-		}
-		if d.Name == "" || uri == "" {
-			continue
-		}
-		var artist string
-		if len(d.Artists.Items) > 0 {
-			artist = d.Artists.Items[0].Profile.Name
-		}
-		items = append(items, catalogItem{Name: d.Name, Artist: artist, Uri: uri})
-	}
-	return items, lib.TotalCount, nil
+	return parseLibraryV3(data)
 }
 
 // fetches one page of a playlists tracks
 func (p *AppPlayer) playlistTracksPage(ctx context.Context, uri string, offset, limit int, force bool) (items []catalogItem, total int, err error) {
+	_, tracks, pg, err := p.fetchPlaylist(ctx, uri, offset, limit, force)
+	if err != nil {
+		return nil, 0, err
+	}
+	return tracksToCatalog(tracks), pg.Total, nil
+}
+
+func (p *AppPlayer) fetchPlaylist(ctx context.Context, uri string, offset, limit int, force bool) (playlistHeader, []libraryTrack, pfPage, error) {
 	body := p.pfBody("fetchPlaylist", map[string]any{
 		"uri": uri, "offset": offset, "limit": limit,
 		"enableWatchFeedEntrypoint": false,
 	})
 	data, err := p.pathfinderQueryEx(ctx, body, force)
 	if err != nil {
-		return nil, 0, err
+		return playlistHeader{}, nil, pfPage{}, err
 	}
-	var r struct {
-		Data struct {
-			PlaylistV2 struct {
-				Content struct {
-					TotalCount int `json:"totalCount"`
-					Items      []struct {
-						ItemV2 struct {
-							Uri  string `json:"_uri"`
-							Data struct {
-								Name    string `json:"name"`
-								Uri     string `json:"uri"`
-								Artists struct {
-									Items []struct {
-										Profile struct {
-											Name string `json:"name"`
-										} `json:"profile"`
-									} `json:"items"`
-								} `json:"artists"`
-							} `json:"data"`
-						} `json:"itemV2"`
-					} `json:"items"`
-				} `json:"content"`
-			} `json:"playlistV2"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(data, &r); err != nil {
-		return nil, 0, err
-	}
-	c := r.Data.PlaylistV2.Content
-	for _, it := range c.Items {
-		d := it.ItemV2.Data
-		if d.Name == "" {
-			continue
-		}
-		uri := d.Uri
-		if uri == "" {
-			uri = it.ItemV2.Uri
-		}
-		var artist string
-		if len(d.Artists.Items) > 0 {
-			artist = d.Artists.Items[0].Profile.Name
-		}
-		items = append(items, catalogItem{Name: d.Name, Artist: artist, Uri: uri})
-	}
-	return items, c.TotalCount, nil
+	return parsePlaylist(data)
 }
 
 // routes a CatalogPage request to the right entity fetcher
