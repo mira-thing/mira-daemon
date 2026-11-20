@@ -19,6 +19,8 @@
 daemon/lyrics_probe.go
 
 # Build files
+/bin/
+/dev/
 /.gocache
 /vcpkg
 /vcpkg_installed
